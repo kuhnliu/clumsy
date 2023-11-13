@@ -14,20 +14,25 @@
 #define QUEUESIZE_MAX  "99999"
 #define QUEUESIZE_DEFAULT 100
 
+#define TB_LINK_MTU 1500
+#define TB_DEFAULT_BUSRT_TIME 10
+
+#define TB_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define TB_MIN(a, b) ((a) < (b) ? (a) : (b))
+
 //---------------------------------------------------------------------
-// rate stats
+// token bucket
 //---------------------------------------------------------------------
-typedef struct {
-	int32_t initialized;
-	uint32_t oldest_index;
-	uint32_t oldest_ts;
-	int64_t accumulated_count;
-	int32_t sample_num;
-	int window_size;
-	float scale;
-	uint32_t *array_sum;
-	uint32_t *array_sample;
-} CRateStats;
+typedef struct TokenBucket {
+    // Parameters
+    int32_t avgRate;
+    int32_t burstSize;
+    uint32_t busrtTime;
+
+    // Varaibles
+    int32_t tokens;
+    uint32_t lastTime;
+} CTokenBucket;
 
 typedef struct {
     PacketNode queueHeadNode;
@@ -35,23 +40,19 @@ typedef struct {
     PacketNode *queueHead;
     PacketNode *queueTail;
     int queueSizeInBytes;
-    CRateStats *rateStats;
+    CTokenBucket *tokenBucket;
 } CRateLimiter;
 
 static CRateLimiter inboundRateLimiter = {0}, outboundRateLimiter = {0};
 
-CRateStats* crate_stats_new(int window_size, float scale);
+CTokenBucket* token_bucket_new(int32_t avgRate, uint32_t burstTime);
 
-void crate_stats_delete(CRateStats *rate);
+void token_bucket_delete(CTokenBucket *tb);
 
-void crate_stats_reset(CRateStats *rate);
+void token_bucket_reset(CTokenBucket *tb, int32_t avgRate, uint32_t burstTime);
 
 // call when packet arrives, count is the packet size in bytes
-void crate_stats_update(CRateStats *rate, int32_t count, uint32_t now_ts);
-
-// calculate rate
-int32_t crate_stats_calculate(CRateStats *rate, uint32_t now_ts);
-
+int token_bucket_consume(CTokenBucket *tb, int32_t avgRate, int32_t tokens, uint32_t now);
 
 //---------------------------------------------------------------------
 // configuration
@@ -72,7 +73,7 @@ static INLINE_FUNCTION short isQueueEmpty(CRateLimiter *rateLimiter) {
 
 static Ihandle* bandwidthSetupUI() {
     Ihandle *bandwidthControlsBox = IupHbox(
-        IupLabel("Queuesize(KB):"),
+        IupLabel("QueueSize(KB):"),
         queueSizeInput = IupText(NULL),
         inboundCheckbox = IupToggle("Inbound", NULL),
         outboundCheckbox = IupToggle("Outbound", NULL),
@@ -123,8 +124,8 @@ static void initRateLimiter(CRateLimiter *rateLimiter) {
         assert(isQueueEmpty(rateLimiter));
     }
 
-	if (rateLimiter->rateStats) crate_stats_delete(rateLimiter->rateStats);
-	rateLimiter->rateStats = crate_stats_new(1000, 1000);
+	if (rateLimiter->tokenBucket) token_bucket_delete(rateLimiter->tokenBucket);
+	rateLimiter->tokenBucket = token_bucket_new(bandwidthLimit * 1024, TB_DEFAULT_BUSRT_TIME);
 }
 
 static int uninitRateLimiter(CRateLimiter *rateLimiter, PacketNode *head, PacketNode *tail) {
@@ -138,9 +139,9 @@ static int uninitRateLimiter(CRateLimiter *rateLimiter, PacketNode *head, Packet
         ++packetCnt;
     }
 
-    if (rateLimiter->rateStats) {
-        crate_stats_delete(rateLimiter->rateStats);
-        rateLimiter->rateStats = NULL;
+    if (rateLimiter->tokenBucket) {
+        token_bucket_delete(rateLimiter->tokenBucket);
+        rateLimiter->tokenBucket = NULL;
     }
 
     return packetCnt;
@@ -175,12 +176,8 @@ static int rateLimiterProcess(CRateLimiter *rateLimiter, PacketNode *head, Packe
     while (!isQueueEmpty(rateLimiter)) {
         pac = rateLimiter->queueTail->prev;
         // chance in range of [0, 10000]
-        int rate = crate_stats_calculate(rateLimiter->rateStats, now_ts);
-        int size = pac->packetLen;
-        if (rate + size > limit) {
+        if (token_bucket_consume(rateLimiter->tokenBucket, limit, pac->packetLen, now_ts) == 0) {
             break;
-        } else {
-            crate_stats_update(rateLimiter->rateStats, size, now_ts);
         }
         rateLimiter->queueSizeInBytes -= pac->packetLen;
         insertAfter(popNode(pac), head);
@@ -202,7 +199,7 @@ static int rateLimiterProcess(CRateLimiter *rateLimiter, PacketNode *head, Packe
 }
 
 static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
-	if (inboundRateLimiter.rateStats == NULL || outboundRateLimiter.rateStats == NULL) {
+	if (inboundRateLimiter.tokenBucket == NULL || outboundRateLimiter.tokenBucket == NULL) {
 		return 0;
 	}
 
@@ -248,141 +245,63 @@ Module bandwidthModule = {
 
 
 //---------------------------------------------------------------------
-// create new CRateStat
+// create new TokenBucket
 //---------------------------------------------------------------------
-CRateStats* crate_stats_new(int window_size, float scale)
+CTokenBucket* token_bucket_new(int32_t avgRate, uint32_t burstTime)
 {
-	CRateStats *rate = (CRateStats*)malloc(sizeof(CRateStats));
-	assert(rate);
-	rate->array_sum = (uint32_t*)malloc(sizeof(uint32_t) * window_size);
-	assert(rate->array_sum);
-	rate->array_sample = (uint32_t*)malloc(sizeof(uint32_t) * window_size);
-	assert(rate->array_sample);
-	rate->window_size = window_size;
-	rate->scale = scale;
-	crate_stats_reset(rate);
-	return rate;
+	CTokenBucket *tb = (CTokenBucket*)malloc(sizeof(CTokenBucket));
+	assert(tb);
+	token_bucket_reset(tb, avgRate, burstTime);
+	return tb;
 }
 
 
 //---------------------------------------------------------------------
 // delete rate
 //---------------------------------------------------------------------
-void crate_stats_delete(CRateStats *rate)
+void token_bucket_delete(CTokenBucket *tb)
 {
-	if (rate) {
-		rate->window_size = 0;
-		if (rate->array_sum) free(rate->array_sum);
-		if (rate->array_sample) free(rate->array_sample);
-		rate->array_sum = NULL;
-		rate->array_sample = NULL;
-		rate->initialized = 0;
-		free(rate);
+	if (tb) {
+		free(tb);
 	}
 }
 
 
 //---------------------------------------------------------------------
-// reset rate
+// reset token bucket
 //---------------------------------------------------------------------
-void crate_stats_reset(CRateStats *rate)
+void token_bucket_reset(CTokenBucket *tb, int32_t avgRate, uint32_t burstTime)
 {
-	int i;
-	for (i = 0; i < rate->window_size; i++) {
-		rate->array_sum[i] = 0;
-		rate->array_sample[i] = 0;
-	}
-	rate->initialized = 0;
-	rate->sample_num = 0;
-	rate->accumulated_count = 0;
-	rate->oldest_ts = 0;
-	rate->oldest_index = 0;
+    tb->avgRate = avgRate;
+    tb->busrtTime = burstTime;
+    tb->burstSize = TB_MAX((avgRate * burstTime + 500) / 1000, TB_LINK_MTU);
+    tb->tokens = tb->burstSize;
+    tb->lastTime = 0;
 }
 
 
 //---------------------------------------------------------------------
-// evict oldest history
+// consume token
 //---------------------------------------------------------------------
-void crate_stats_evict(CRateStats *rate, uint32_t now_ts)
+int token_bucket_consume(CTokenBucket *tb, int32_t avgRate, int32_t tokens, uint32_t now)
 {
-	if (rate->initialized == 0) 
-		return;
+    uint32_t elapsed = now - tb->lastTime;
 
-	uint32_t new_oldest_ts = now_ts - ((uint32_t)rate->window_size) + 1;
+    if (tb->avgRate != avgRate) {
+        token_bucket_reset(tb, avgRate, tb->busrtTime);
+    }
 
-	if (((int32_t)(new_oldest_ts - rate->oldest_ts)) < 0) 
-		return;
+    tb->lastTime = now;
+    tb->tokens += (elapsed * tb->avgRate + 500) / 1000;
+    tb->tokens = TB_MIN(tb->tokens, tb->burstSize);
 
-	while (((int32_t)(rate->oldest_ts - new_oldest_ts)) < 0) {
-		uint32_t index = rate->oldest_index;
-		if (rate->sample_num == 0) break;
-		rate->sample_num -= rate->array_sample[index];
-		rate->accumulated_count -= rate->array_sum[index];
-		rate->array_sample[index] = 0;
-		rate->array_sum[index] = 0;
-		rate->oldest_index++;
-		if (rate->oldest_index >= (uint32_t)rate->window_size) {
-			rate->oldest_index = 0;
-		}
-		rate->oldest_ts++;
-	}
-	assert(rate->sample_num >= 0);
-	assert(rate->accumulated_count >= 0);
-	rate->oldest_ts = new_oldest_ts;
+    if (tb->tokens < tokens)
+    {
+        return 0;
+    }
+
+    tb->tokens -= tokens;
+
+    return 1;
 }
-
-
-//---------------------------------------------------------------------
-// update stats
-//---------------------------------------------------------------------
-void crate_stats_update(CRateStats *rate, int32_t count, uint32_t now_ts)
-{
-	if (rate->initialized == 0) {
-		rate->oldest_ts = now_ts;
-		rate->oldest_index = 0;
-		rate->accumulated_count = 0;
-		rate->sample_num = 0;
-		rate->initialized = 1;
-	}
-
-	if (((int32_t)(now_ts - rate->oldest_ts)) < 0) {
-		return;
-	}
-
-	crate_stats_evict(rate, now_ts);
-
-	int32_t offset = (int32_t)(now_ts - rate->oldest_ts);
-	int32_t index = (rate->oldest_index + offset) % rate->window_size;
-
-	rate->sample_num++;
-	rate->accumulated_count += count;
-	rate->array_sum[index] += count;
-	rate->array_sample[index] += 1;
-}
-
-
-//---------------------------------------------------------------------
-// calculate
-//---------------------------------------------------------------------
-int32_t crate_stats_calculate(CRateStats *rate, uint32_t now_ts)
-{
-	int32_t active_size = (int32_t)(now_ts - rate->oldest_ts + 1);
-	float r;
-
-	crate_stats_evict(rate, now_ts);
-
-	if (rate->initialized == 0 || 
-		rate->sample_num <= 0 || 
-		active_size <= 1 || 
-		active_size < rate->window_size) {
-		return -1;
-	}
-
-	r = ((((float)rate->accumulated_count) * rate->scale) / 
-				rate->window_size) + 0.5f;
-
-	return (int32_t)r;
-}
-
-
 
