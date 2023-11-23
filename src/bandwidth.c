@@ -57,13 +57,14 @@ int token_bucket_consume(CTokenBucket *tb, int32_t avgRate, int32_t tokens, uint
 //---------------------------------------------------------------------
 // configuration
 //---------------------------------------------------------------------
-static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *queueSizeInput;
+static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *queueSizeInput, *drainQueueCheckbox;
 
 static volatile short bandwidthEnabled = 0,
     bandwidthInbound = 1, bandwidthOutbound = 1;
 static volatile short maxQueueSizeInKBytes = 0;
 
 static volatile LONG bandwidthLimit = BANDWIDTH_DEFAULT; 
+static volatile short drainQueueInFull = 1;
 
 static INLINE_FUNCTION short isQueueEmpty(CRateLimiter *rateLimiter) {
     short ret = rateLimiter->queueHead->next == rateLimiter->queueTail;
@@ -75,6 +76,7 @@ static Ihandle* bandwidthSetupUI() {
     Ihandle *bandwidthControlsBox = IupHbox(
         IupLabel("QueueSize(KB):"),
         queueSizeInput = IupText(NULL),
+        drainQueueCheckbox = IupToggle("DrainQueue", NULL),
         inboundCheckbox = IupToggle("Inbound", NULL),
         outboundCheckbox = IupToggle("Outbound", NULL),
         IupLabel("Limit(KB/s):"),
@@ -92,6 +94,8 @@ static Ihandle* bandwidthSetupUI() {
     IupSetAttribute(inboundCheckbox, SYNCED_VALUE, (char*)&bandwidthInbound);
     IupSetCallback(outboundCheckbox, "ACTION", (Icallback)uiSyncToggle);
     IupSetAttribute(outboundCheckbox, SYNCED_VALUE, (char*)&bandwidthOutbound);
+    IupSetCallback(drainQueueCheckbox, "ACTION", (Icallback)uiSyncToggle);
+    IupSetAttribute(drainQueueCheckbox, SYNCED_VALUE, (char*)&drainQueueInFull);
     IupSetAttribute(queueSizeInput, "VISIBLECOLUMNS", "3");
     IupSetAttribute(queueSizeInput, "VALUE", STR(QUEUESIZE_DEFAULT));
     IupSetCallback(queueSizeInput, "VALUECHANGED_CB", uiSyncInt32);
@@ -100,6 +104,7 @@ static Ihandle* bandwidthSetupUI() {
     IupSetAttribute(queueSizeInput, INTEGER_MIN, QUEUESIZE_MIN);
 
     // enable by default to avoid confusing
+    IupSetAttribute(drainQueueCheckbox, "VALUE", "ON");
     IupSetAttribute(inboundCheckbox, "VALUE", "ON");
     IupSetAttribute(outboundCheckbox, "VALUE", "ON");
 
@@ -107,6 +112,7 @@ static Ihandle* bandwidthSetupUI() {
         setFromParameter(inboundCheckbox, "VALUE", NAME"-inbound");
         setFromParameter(outboundCheckbox, "VALUE", NAME"-outbound");
         setFromParameter(bandwidthInput, "VALUE", NAME"-bandwidth");
+        setFromParameter(drainQueueCheckbox, "VALUE", NAME"-drainqueue");
     }
 
     return bandwidthControlsBox;
@@ -184,13 +190,20 @@ static int rateLimiterProcess(CRateLimiter *rateLimiter, PacketNode *head, Packe
     }
 
     int dropped = 0;
-    while (rateLimiter->queueSizeInBytes > maxQueueSizeInKBytes * 1024 && !isQueueEmpty(rateLimiter)) {
-        pac = rateLimiter->queueHead->next;
-        LOG("dropped with bandwidth %dKB/s, direction %s",
-            (int)bandwidthLimit, pac->addr.Outbound ? "OUTBOUND" : "INBOUND");
-        rateLimiter->queueSizeInBytes -= pac->packetLen;
-        freeNode(popNode(pac));
-        ++dropped;
+    int targetQueueSize = maxQueueSizeInKBytes * 1024;
+    if (rateLimiter->queueSizeInBytes > targetQueueSize && !isQueueEmpty(rateLimiter)) {
+        if (drainQueueInFull) {
+            targetQueueSize = targetQueueSize / 3;
+        }
+
+        do {
+            pac = rateLimiter->queueHead->next;
+            LOG("dropped with bandwidth %dKB/s, direction %s",
+                (int)bandwidthLimit, pac->addr.Outbound ? "OUTBOUND" : "INBOUND");
+            rateLimiter->queueSizeInBytes -= pac->packetLen;
+            freeNode(popNode(pac));
+            ++dropped;
+        } while (rateLimiter->queueSizeInBytes > targetQueueSize && !isQueueEmpty(rateLimiter));
     }
 
     assert(rateLimiter->queueSizeInBytes >= 0);
