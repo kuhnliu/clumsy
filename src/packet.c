@@ -17,8 +17,7 @@ void initPacketNodeList() {
 // TODO  using malloc in the loop is not good for performance
 //       just not sure I can write a better memory allocator
 PacketNode* createNode(char* buf, UINT len, WINDIVERT_ADDRESS *addr) {
-    PacketNode *newNode = (PacketNode*)malloc(sizeof(PacketNode));
-    newNode->packet = (char*)malloc(len);
+    PacketNode *newNode = (PacketNode*)malloc(sizeof(PacketNode) + len);
     memcpy(newNode->packet, buf, len);
     newNode->packetLen = len;
     memcpy(&(newNode->addr), addr, sizeof(WINDIVERT_ADDRESS));
@@ -28,7 +27,6 @@ PacketNode* createNode(char* buf, UINT len, WINDIVERT_ADDRESS *addr) {
 
 void freeNode(PacketNode *node) {
     assert((node != head) && (node != tail));
-    free(node->packet);
     free(node);
 }
 

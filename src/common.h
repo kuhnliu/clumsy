@@ -94,11 +94,11 @@ static void VsLog(const char* pFmt, ...)
 
 // package node
 typedef struct _NODE {
-    char *packet;
     UINT packetLen;
     WINDIVERT_ADDRESS addr;
     DWORD timestamp; // ! timestamp isn't filled when creating node since it's only needed for lag
     struct _NODE *prev, *next;
+    char packet[1];
 } PacketNode;
 
 void initPacketNodeList();

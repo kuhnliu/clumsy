@@ -325,8 +325,9 @@ static DWORD divertClockLoop(LPVOID arg) {
 }
 
 static DWORD divertReadLoop(LPVOID arg) {
-    char packetBuf[MAX_PACKETSIZE];
-    WINDIVERT_ADDRESS addrBuf;
+    static char packetBuf[MAX_PACKETSIZE * WINDIVERT_BATCH_MAX];
+    static WINDIVERT_ADDRESS addrBuf[WINDIVERT_BATCH_MAX];
+    UINT addrLen = sizeof(addrBuf);
     UINT readLen;
     PacketNode *pnode;
     DWORD waitResult;
@@ -336,7 +337,7 @@ static DWORD divertReadLoop(LPVOID arg) {
     for(;;) {
         // each step must fully consume the list
         assert(isListEmpty()); // FIXME has failed this assert before. don't know why
-        if (!WinDivertRecv(divertHandle, packetBuf, MAX_PACKETSIZE, &readLen, &addrBuf)) {
+        if (!WinDivertRecvEx(divertHandle, packetBuf, sizeof(packetBuf), &readLen, 0, addrBuf, &addrLen, NULL)) {
             DWORD lastError = GetLastError();
             if (lastError == ERROR_INVALID_HANDLE || lastError == ERROR_OPERATION_ABORTED) {
                 // treat closing handle as quit
@@ -346,7 +347,7 @@ static DWORD divertReadLoop(LPVOID arg) {
             LOG("Failed to recv a packet. (%lu)", GetLastError());
             continue;
         }
-        if (readLen > MAX_PACKETSIZE) {
+        if (readLen > sizeof(packetBuf)) {
             // don't know how this can happen
             LOG("Internal Error: DivertRecv truncated recv packet."); 
         }
@@ -365,9 +366,21 @@ static DWORD divertReadLoop(LPVOID arg) {
                     }
                     return 0;
                 }
-                // create node and put it into the list
-                pnode = createNode(packetBuf, readLen, &addrBuf);
-                appendNode(pnode);
+
+                PVOID ppCurrent = &packetBuf, ppNext = NULL;
+                UINT PCurrentLen = readLen, pNextLen = 0, i = 0;
+                while (WinDivertHelperParsePacket(ppCurrent, PCurrentLen, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &ppNext, &pNextLen)) {
+                    // create node and put it into the list
+                    pnode = createNode(ppCurrent, PCurrentLen - pNextLen, &(addrBuf[i++]));
+                    appendNode(pnode);
+
+                    if (pNextLen == 0 || ppNext == NULL) break;
+
+                    ppCurrent = ppNext;
+                    PCurrentLen = pNextLen;
+                }
+                if (i != addrLen / sizeof(WINDIVERT_ADDRESS)) assert(0);
+
                 divertConsumeStep();
                 lastScheduleTime = GetTickCount();
                 /***************** leave critical region ************************/
