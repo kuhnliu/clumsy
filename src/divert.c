@@ -247,7 +247,7 @@ static DWORD divertClockLoop(LPVOID arg) {
         // use acquire as wait for yielding thread
         startTick = GetTickCount();
         if (lastScheduleTime + CLOCK_WAITMS <= startTick) {
-            waitResult = WaitForSingleObject(mutex, CLOCK_WAITMS);
+            waitResult = WaitForSingleObject(mutex, 0);
             switch(waitResult) {
                 case WAIT_OBJECT_0:
                     /***************** enter critical region ************************/
@@ -262,8 +262,9 @@ static DWORD divertClockLoop(LPVOID arg) {
                     break;
                 case WAIT_TIMEOUT:
                     // read loop is processing, so we can skip this run
-                    LOG("!!! Skipping one run");
-                    Sleep(CLOCK_WAITMS);
+                    // LOG("!!! Skipping one run");
+                    if (stopLooping)
+                        Sleep(CLOCK_WAITMS);
                     break;
                 case WAIT_ABANDONED:
                     LOG("Acquired abandoned mutex");
@@ -275,7 +276,10 @@ static DWORD divertClockLoop(LPVOID arg) {
                     break;
             }
         } else {
-            Sleep(CLOCK_WAITMS - (startTick - lastScheduleTime));
+            DWORD tmpLastScheduleTime = lastScheduleTime;
+            if (!stopLooping && startTick > tmpLastScheduleTime && CLOCK_WAITMS > (startTick - tmpLastScheduleTime)) {
+                Sleep(CLOCK_WAITMS - (startTick - tmpLastScheduleTime));
+            }
         }
 
         // need to get the lock here
