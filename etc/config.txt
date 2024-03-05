@@ -3,6 +3,10 @@
 # filter-name:filter-text
 # see <https://github.com/basil00/Divert/wiki/WinDivert-Documentation#7-filter-language> for details
 
+all udp packets: udp and (udp.DstPort != 53 and udp.SrcPort != 53)
+
+udp stun packet: udp and (udp.PayloadLength >= 20) and (udp.Payload[0] < 3) and (udp.Payload[4] == 0x21) and (udp.Payload[5] == 0x12) and (udp.Payload[6] == 0xA4) and (udp.Payload[7] == 0x42)
+
 # loopback packets can only be filtered using 'outbound'.
 localhost ipv4 all: outbound and loopback
 localhost ipv4 tcp: tcp and outbound and loopback

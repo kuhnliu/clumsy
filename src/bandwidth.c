@@ -15,7 +15,7 @@
 #define QUEUESIZE_DEFAULT 100
 
 #define TB_LINK_MTU 1500
-#define TB_DEFAULT_BUSRT_TIME 10
+#define TB_DEFAULT_BUSRT_TIME 25
 
 #define TB_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define TB_MIN(a, b) ((a) < (b) ? (a) : (b))
